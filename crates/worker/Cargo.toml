@@ -1,0 +1,12 @@
+[package]
+name = "dti-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dti-model.workspace = true
+dti-protocol.workspace = true
+serde_json.workspace = true
+wasip2.workspace = true
+wit-bindgen.workspace = true

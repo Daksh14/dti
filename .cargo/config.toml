@@ -1,0 +1,2 @@
+[alias]
+build-worker = "build -p dti-worker --target wasm32-wasip2 --release"

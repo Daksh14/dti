@@ -1,0 +1,44 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/protocol",
+    "crates/model",
+    "crates/worker",
+    "crates/runner",
+    "crates/coordinator",
+]
+# The worker only builds for wasm32-wasip2; build it with `cargo build-worker`.
+default-members = [
+    "crates/protocol",
+    "crates/model",
+    "crates/runner",
+    "crates/coordinator",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+dti-protocol = { path = "crates/protocol" }
+dti-model = { path = "crates/model" }
+
+anyhow = "1"
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+http-body-util = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+toml = "1"
+wasip2 = "2"
+wasmtime = "50"
+wasmtime-wasi = "50"
+wasmtime-wasi-http = "50"
+wit-bindgen = "0.63"
+
+[profile.release]
+# Smaller, more deterministic worker builds.
+codegen-units = 1

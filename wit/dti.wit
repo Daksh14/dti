@@ -1,0 +1,35 @@
+package dti:runner@0.1.0;
+
+/// Progress the worker reports to the runner for display.
+///
+/// Everything here is self-reported by the guest, so the runner only shows it.
+/// Network traffic and memory use are measured by the runner itself.
+interface telemetry {
+    record run-info {
+        run-id: string,
+        model: string,
+        params: u64,
+        worker-id: string,
+    }
+
+    record step-metrics {
+        round: u64,
+        step: u32,
+        inner-steps: u32,
+        loss: f32,
+    }
+
+    /// The worker joined a training run.
+    joined: func(info: run-info);
+    /// Periodic progress during local training.
+    step: func(metrics: step-metrics);
+    /// The worker uploaded its update for `round`.
+    round-finished: func(round: u64, update-bytes: u64);
+    log: func(message: string);
+}
+
+/// What a worker component may import beyond `wasi:http/outgoing-handler`
+/// and the WASI CLI basics that `wasm32-wasip2` std needs.
+world worker {
+    import telemetry;
+}
