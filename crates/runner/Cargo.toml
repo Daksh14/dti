@@ -13,6 +13,14 @@ toml.workspace = true
 wasmtime.workspace = true
 wasmtime-wasi.workspace = true
 wasmtime-wasi-http.workspace = true
+wasmtime-wasi-nn = { workspace = true, optional = true, features = ["pytorch"] }
+# Same version as wasmtime-wasi-nn uses; only for checking CUDA is there.
+tch = { version = "0.17", optional = true, default-features = false }
 bytes = "1"
 http = "1"
 http-body = "1"
+
+[features]
+# Grant the worker `wasi:nn` with Wasmtime's PyTorch backend, for the graphs
+# listed in the config. Needs libtorch 2.4 (see the README).
+pytorch = ["dep:wasmtime-wasi-nn", "dep:tch"]

@@ -33,3 +33,16 @@ interface telemetry {
 world worker {
     import telemetry;
 }
+
+/// A worker that runs its training steps as a TorchScript graph through
+/// `wasi:nn` (build it with `--features nn`).
+///
+/// The runner grants `wasi:nn` only when its config lists graphs, and the
+/// worker can only `load-by-name` those: `load` from guest bytes always fails.
+world worker-nn {
+    include worker;
+    import wasi:nn/graph@0.2.0-rc-2024-10-28;
+    import wasi:nn/inference@0.2.0-rc-2024-10-28;
+    import wasi:nn/tensor@0.2.0-rc-2024-10-28;
+    import wasi:nn/errors@0.2.0-rc-2024-10-28;
+}

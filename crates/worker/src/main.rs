@@ -1,20 +1,31 @@
 //! The training worker. It runs inside `dti-runner`, which grants it outbound
 //! HTTP to the coordinator and the `dti:runner/telemetry` interface, and nothing else.
+//! Built with `--features nn`, it also imports `wasi:nn` and runs its training
+//! steps in a TorchScript graph the runner was configured with.
 //!
 //! Each round follows DiLoCo: pull the global weights, run `inner_steps` of
 //! AdamW on this worker's shard, then push `global - local` (int8-compressed)
 //! back to the coordinator.
 
 mod http;
+#[cfg(feature = "nn")]
+mod nn;
 
+#[cfg(not(feature = "nn"))]
 wit_bindgen::generate!({
     path: "../../wit",
     world: "worker",
 });
+#[cfg(feature = "nn")]
+wit_bindgen::generate!({
+    path: "../../wit",
+    world: "worker-nn",
+    generate_all,
+});
 
 use dti::runner::telemetry;
-use dti_model::{AdamW, Rng};
-use dti_protocol::{JoinResponse, Task, decode_f32s, encode_update};
+use dti_model::{AdamW, Model, Rng};
+use dti_protocol::{JoinResponse, ModelSpec, Task, decode_f32s, encode_update};
 use http::Client;
 
 /// Consecutive failed rounds before the worker gives up.
@@ -44,7 +55,7 @@ fn run() -> Result<(), String> {
         worker_id: worker_id.clone(),
     });
 
-    let model = dti_model::build(run.model);
+    let model = Compute::new(run.model);
     let mut opt = AdamW::new(model.num_params(), run.train.weight_decay);
     let mut grad = vec![0.0; model.num_params()];
     let mut last_round = None;
@@ -68,7 +79,7 @@ fn run() -> Result<(), String> {
         }
 
         match train_round(
-            &client, &worker_id, &task, &run.train, &*model, &mut opt, &mut grad,
+            &client, &worker_id, &task, &run.train, &model, &mut opt, &mut grad,
         ) {
             Ok(()) => failures = 0,
             Err(e) => {
@@ -92,7 +103,7 @@ fn train_round(
     worker_id: &str,
     task: &Task,
     train: &dti_protocol::TrainConfig,
-    model: &dyn dti_model::Model,
+    model: &Compute,
     opt: &mut AdamW,
     grad: &mut [f32],
 ) -> Result<(), String> {
@@ -126,7 +137,7 @@ fn train_round(
     let report_every = (train.inner_steps / 10).max(1);
     for step in 0..train.inner_steps {
         let start = rng.below((data.len() - window + 1) as u64) as usize;
-        let loss = model.loss_and_grad(&params, &data[start..start + window], grad);
+        let loss = model.loss_and_grad(&params, &data[start..start + window], grad)?;
         opt.step(&mut params, grad, train.inner_lr);
         if step % report_every == 0 || step + 1 == train.inner_steps {
             telemetry::step(telemetry::StepMetrics {
@@ -151,6 +162,56 @@ fn train_round(
     expect_status(&sent, 202, "update")?;
     telemetry::round_finished(task.round, body.len() as u64);
     Ok(())
+}
+
+/// Where the forward and backward passes of local training run.
+enum Compute {
+    /// `dti-model`'s Rust code, inside this wasm.
+    Wasm(Box<dyn Model>),
+    /// A TorchScript graph the runner executes through `wasi:nn`.
+    #[cfg(feature = "nn")]
+    Graph(nn::Graph),
+}
+
+impl Compute {
+    /// Uses the runner's `wasi:nn` graph named after the model when there is
+    /// one, and the Rust model otherwise.
+    fn new(spec: ModelSpec) -> Self {
+        let model = dti_model::build(spec);
+        #[cfg(feature = "nn")]
+        {
+            let name = spec.to_string();
+            match nn::Graph::load(&name, model.num_params()) {
+                Ok(graph) => {
+                    telemetry::log(&format!("training steps run in wasi:nn graph {name:?}"));
+                    return Compute::Graph(graph);
+                }
+                Err(e) => telemetry::log(&format!("{e}; training in wasm instead")),
+            }
+        }
+        Compute::Wasm(model)
+    }
+
+    fn num_params(&self) -> usize {
+        match self {
+            Compute::Wasm(model) => model.num_params(),
+            #[cfg(feature = "nn")]
+            Compute::Graph(graph) => graph.num_params(),
+        }
+    }
+
+    fn loss_and_grad(
+        &self,
+        params: &[f32],
+        tokens: &[u8],
+        grad: &mut [f32],
+    ) -> Result<f32, String> {
+        match self {
+            Compute::Wasm(model) => Ok(model.loss_and_grad(params, tokens, grad)),
+            #[cfg(feature = "nn")]
+            Compute::Graph(graph) => graph.loss_and_grad(params, tokens, grad),
+        }
+    }
 }
 
 fn expect_status(r: &http::Response, want: u16, what: &str) -> Result<(), String> {

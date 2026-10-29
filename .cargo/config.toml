@@ -1,2 +1,4 @@
 [alias]
 build-worker = "build -p dti-worker --target wasm32-wasip2 --release"
+# Same output path, but the worker imports wasi:nn and trains in a TorchScript graph.
+build-worker-nn = "build -p dti-worker --target wasm32-wasip2 --release --features nn"

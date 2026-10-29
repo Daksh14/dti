@@ -7,9 +7,20 @@ coordinator = "https://coordinator.example.com"
 # Cap on the worker's linear memory, in MiB.
 max-memory-mb = 1024
 
-# Accepted but not enforced yet: the runner exposes no GPU until the
-# wasi:webgpu backend is wired up.
+# Accepted but not enforced yet. The only GPU access is through wasi:nn
+# graphs with target = "gpu" below, and their GPU memory is not limited.
 gpu-memory-mb = 0
 
 # Refuse to start unless the worker wasm has this SHA-256.
 # expected-sha256 = "..."
+
+# TorchScript graphs the worker may run through wasi:nn, by name. Needs a
+# worker built with `cargo build-worker-nn` and a runner built with
+# `--features pytorch`. A graph runs as native code in the runner, outside the
+# sandbox, so its SHA-256 is required. Paths are relative to this file.
+# Export one with `python graphs/export.py byte-bigram byte-bigram.pt`.
+#
+# [graphs.byte-bigram]
+# path = "byte-bigram.pt"
+# sha256 = "..."
+# target = "cpu"   # or "gpu" (CUDA device 0)

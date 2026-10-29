@@ -10,3 +10,7 @@ dti-protocol.workspace = true
 serde_json.workspace = true
 wasip2.workspace = true
 wit-bindgen.workspace = true
+
+[features]
+# Run training steps as a TorchScript graph through `wasi:nn` (world `worker-nn`).
+nn = []

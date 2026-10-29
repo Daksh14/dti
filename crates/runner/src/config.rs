@@ -1,5 +1,6 @@
 use clap::Parser;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use wasmtime::bail;
 use wasmtime::error::Context;
@@ -37,16 +38,53 @@ struct FileConfig {
     max_memory_mb: Option<u64>,
     gpu_memory_mb: Option<u64>,
     expected_sha256: Option<String>,
+    #[serde(default)]
+    graphs: BTreeMap<String, GraphFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct GraphFile {
+    path: PathBuf,
+    sha256: String,
+    #[serde(default)]
+    target: Target,
+}
+
+/// Where the PyTorch backend runs a graph.
+#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Target {
+    #[default]
+    Cpu,
+    /// CUDA device 0; needs a CUDA build of libtorch.
+    Gpu,
+}
+
+/// A TorchScript graph the worker may run through `wasi:nn`, by name.
+///
+/// The graph executes as native code in the runner, outside the sandbox,
+/// which is why its hash must be pinned.
+pub struct Graph {
+    pub name: String,
+    pub path: PathBuf,
+    #[cfg_attr(
+        not(feature = "pytorch"),
+        expect(dead_code, reason = "checked when loading")
+    )]
+    pub sha256: String,
+    pub target: Target,
 }
 
 pub struct Config {
     pub wasm: PathBuf,
     pub coordinator: String,
     pub max_memory_mb: u64,
-    /// Accepted so config files can carry it, but nothing enforces it until a
-    /// `wasi:webgpu` backend is wired up.
+    /// Accepted so config files can carry it, but not enforced: `wasi:nn`
+    /// graphs on the GPU are not limited yet.
     pub gpu_memory_mb: Option<u64>,
     pub expected_sha256: Option<String>,
+    pub graphs: Vec<Graph>,
 }
 
 impl Config {
@@ -65,6 +103,28 @@ impl Config {
         if max_memory_mb == 0 {
             bail!("max-memory-mb must be greater than zero");
         }
+        if !file.graphs.is_empty() && !cfg!(feature = "pytorch") {
+            bail!(
+                "the config lists [graphs] but this runner was built without PyTorch; \
+                 rebuild it with `cargo build --release --features pytorch`"
+            );
+        }
+        // Graph paths are relative to the config file.
+        let base = cli
+            .config
+            .as_deref()
+            .and_then(Path::parent)
+            .unwrap_or(Path::new(""));
+        let graphs = file
+            .graphs
+            .into_iter()
+            .map(|(name, g)| Graph {
+                name,
+                path: base.join(g.path),
+                sha256: g.sha256.trim().to_ascii_lowercase(),
+                target: g.target,
+            })
+            .collect();
         Ok(Self {
             wasm: cli.wasm,
             coordinator,
@@ -74,6 +134,7 @@ impl Config {
                 .expect_sha256
                 .or(file.expected_sha256)
                 .map(|h| h.trim().to_ascii_lowercase()),
+            graphs,
         })
     }
 }

@@ -37,6 +37,7 @@ wasip2 = "2"
 wasmtime = "50"
 wasmtime-wasi = "50"
 wasmtime-wasi-http = "50"
+wasmtime-wasi-nn = { version = "50", default-features = false }
 wit-bindgen = "0.63"
 
 [profile.release]

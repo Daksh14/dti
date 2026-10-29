@@ -3,15 +3,18 @@
 //! * outbound HTTP(S) to exactly one origin, the coordinator
 //! * no filesystem, environment variables or raw sockets
 //! * a hard cap on linear memory
+//! * `wasi:nn`, only if the config lists TorchScript graphs, and then only those
 //!
 //! Network and memory figures shown on screen are measured here, not reported
 //! by the guest; training progress comes from the worker via `dti:runner/telemetry`.
 
 mod config;
 mod egress;
+#[cfg(feature = "pytorch")]
+mod nn;
 
 use clap::Parser;
-use config::{Cli, Config};
+use config::{Cli, Config, Target};
 use egress::{Egress, NetStats, Origin};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -51,7 +54,25 @@ fn main() -> wasmtime::Result<()> {
     println!("  filesystem   none");
     println!("  env vars     none");
     println!("  raw sockets  none");
-    println!("  gpu          none (wasi:webgpu backend not wired up yet)");
+    if config.graphs.is_empty() {
+        println!("  wasi:nn      none");
+    }
+    for graph in &config.graphs {
+        println!(
+            "  wasi:nn      {:?} from {}, PyTorch on {}",
+            graph.name,
+            graph.path.display(),
+            match graph.target {
+                Target::Cpu => "cpu",
+                Target::Gpu => "gpu",
+            }
+        );
+    }
+    if config.graphs.iter().any(|g| g.target == Target::Gpu) {
+        println!("  gpu          cuda:0, for wasi:nn graphs only");
+    } else {
+        println!("  gpu          none");
+    }
     if let Some(expected) = &config.expected_sha256 {
         if *expected != sha256 {
             bail!("wasm SHA-256 mismatch: expected {expected}, got {sha256}");
@@ -62,17 +83,40 @@ fn main() -> wasmtime::Result<()> {
         println!("  warning: coordinator is plain http, traffic is not encrypted");
     }
     if config.gpu_memory_mb.is_some_and(|mb| mb > 0) {
-        println!("  warning: gpu-memory-mb is not enforced yet, this runner exposes no GPU");
+        println!("  warning: gpu-memory-mb is not enforced yet");
     }
-    println!();
+    if !config.graphs.is_empty() {
+        println!(
+            "  warning: wasi:nn tensors and PyTorch's own memory do not count toward the memory cap"
+        );
+    }
 
     let engine = Engine::default();
     let component = Component::new(&engine, &wasm).context("loading worker component")?;
+    let imports_nn = component
+        .component_type()
+        .imports(&engine)
+        .any(|(name, _)| name.starts_with("wasi:nn/"));
+    if imports_nn && config.graphs.is_empty() {
+        bail!("the worker imports wasi:nn but the config lists no [graphs] for it to run");
+    }
+    if !imports_nn && !config.graphs.is_empty() {
+        println!("  warning: [graphs] are configured but the worker does not import wasi:nn");
+    }
+    println!();
 
     let mut linker = Linker::<State>::new(&engine);
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
     wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker)?;
     telemetry::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)?;
+    #[cfg(feature = "pytorch")]
+    let nn = nn::load(&config.graphs)?;
+    #[cfg(feature = "pytorch")]
+    if !config.graphs.is_empty() {
+        wasmtime_wasi_nn::wit::add_to_linker(&mut linker, |state: &mut State| {
+            wasmtime_wasi_nn::wit::WasiNnView::new(&mut state.table, &mut state.nn)
+        })?;
+    }
 
     let net = Arc::new(NetStats::default());
     let state = State {
@@ -83,6 +127,8 @@ fn main() -> wasmtime::Result<()> {
             .inherit_stderr()
             .build(),
         http: WasiHttpCtx::new(),
+        #[cfg(feature = "pytorch")]
+        nn,
         table: ResourceTable::new(),
         egress: Egress {
             allowed: origin,
@@ -128,6 +174,8 @@ fn main() -> wasmtime::Result<()> {
 struct State {
     wasi: WasiCtx,
     http: WasiHttpCtx,
+    #[cfg(feature = "pytorch")]
+    nn: wasmtime_wasi_nn::wit::WasiNnCtx,
     table: ResourceTable,
     egress: Egress,
     memory: MemoryCap,
