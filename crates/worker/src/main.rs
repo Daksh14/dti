@@ -1,31 +1,28 @@
 //! The training worker. It runs inside `dti-runner`, which grants it outbound
-//! HTTP to the coordinator and the `dti:runner/telemetry` interface, and nothing else.
-//! Built with `--features nn`, it also imports `wasi:nn` and runs its training
-//! steps in a TorchScript graph the runner was configured with.
+//! HTTP to the coordinator and the volunteer's data origins, `wasi:nn` for
+//! the TorchScript graphs the volunteer configured, and `dti:runner/telemetry`.
 //!
 //! Each round follows DiLoCo: pull the global weights, run `inner_steps` of
-//! AdamW on this worker's shard, then push `global - local` (int8-compressed)
-//! back to the coordinator.
+//! AdamW on the next text in this worker's slices of the data, then push
+//! `global - local` (int8-compressed) back to the coordinator. The forward and
+//! backward passes run in libtorch through `wasi:nn`. The worker stops once it
+//! has downloaded as much data as the volunteer's budget allows.
 
+mod data;
 mod http;
-#[cfg(feature = "nn")]
 mod nn;
+mod parquet;
 
-#[cfg(not(feature = "nn"))]
 wit_bindgen::generate!({
     path: "../../wit",
     world: "worker",
-});
-#[cfg(feature = "nn")]
-wit_bindgen::generate!({
-    path: "../../wit",
-    world: "worker-nn",
     generate_all,
 });
 
+use data::Data;
 use dti::runner::telemetry;
-use dti_model::{AdamW, Model, Rng};
-use dti_protocol::{JoinResponse, ModelSpec, Task, decode_f32s, encode_update};
+use dti_model::AdamW;
+use dti_protocol::{JoinResponse, Task, decode_f32s, encode_update};
 use http::Client;
 
 /// Consecutive failed rounds before the worker gives up.
@@ -39,9 +36,12 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let base = std::env::args()
-        .nth(1)
-        .ok_or("usage: dti-worker <coordinator-url>")?;
+    let usage = "usage: dti-worker <coordinator-url> <data-budget-bytes>";
+    let mut args = std::env::args().skip(1);
+    let (Some(base), Some(budget)) = (args.next(), args.next()) else {
+        return Err(usage.into());
+    };
+    let budget: u64 = budget.parse().map_err(|_| usage)?;
     let client = Client::new(&base)?;
 
     let joined = client.post("/v1/join", "application/json", b"{}")?;
@@ -54,10 +54,14 @@ fn run() -> Result<(), String> {
         params: run.num_params,
         worker_id: worker_id.clone(),
     });
+    telemetry::log(&format!("training on {}", run.data));
 
-    let model = Compute::new(run.model);
-    let mut opt = AdamW::new(model.num_params(), run.train.weight_decay);
-    let mut grad = vec![0.0; model.num_params()];
+    let num_params = usize::try_from(run.num_params).map_err(|_| "model too large")?;
+    let graph = nn::Graph::load(&run.model.to_string(), num_params)
+        .map_err(|e| format!("{e} (the runner config needs it under [graphs])"))?;
+    let mut data = Data::new(&client, &worker_id, budget);
+    let mut opt = AdamW::new(num_params, run.train.weight_decay);
+    let mut grad = vec![0.0; num_params];
     let mut last_round = None;
     let mut failures = 0;
 
@@ -78,11 +82,32 @@ fn run() -> Result<(), String> {
             continue;
         }
 
-        match train_round(
-            &client, &worker_id, &task, &run.train, &model, &mut opt, &mut grad,
-        ) {
-            Ok(()) => failures = 0,
+        let round = Round {
+            client: &client,
+            worker_id: &worker_id,
+            task: &task,
+            train: &run.train,
+            graph: &graph,
+        };
+        match round.train(&mut data, &mut opt, &mut grad) {
+            Ok(true) => {
+                failures = 0;
+                last_round = Some(task.round);
+            }
+            Ok(false) => {
+                telemetry::log(&if data.budget_left() == 0 {
+                    "data budget used up".to_string()
+                } else {
+                    format!(
+                        "no more slices to train on that fit the {:.3} GB left of the budget",
+                        data.budget_left() as f64 / 1e9
+                    )
+                });
+                return Ok(());
+            }
             Err(e) => {
+                // Train this round's text again on the next attempt.
+                data.rewind();
                 failures += 1;
                 telemetry::log(&format!(
                     "round {} failed ({failures}/{MAX_FAILURES}): {e}",
@@ -94,123 +119,90 @@ fn run() -> Result<(), String> {
                 sleep_ms(2000);
             }
         }
-        last_round = Some(task.round);
     }
 }
 
-fn train_round(
-    client: &Client,
-    worker_id: &str,
-    task: &Task,
-    train: &dti_protocol::TrainConfig,
-    model: &Compute,
-    opt: &mut AdamW,
-    grad: &mut [f32],
-) -> Result<(), String> {
-    let weights = client.get(&format!("/v1/weights/{}", task.round))?;
-    if weights.status == 409 {
-        return Err("round moved on before we fetched weights".into());
-    }
-    expect_status(&weights, 200, "weights")?;
-    let global = decode_f32s(&weights.body).map_err(|e| format!("weights: {e}"))?;
-    if global.len() != model.num_params() {
-        return Err(format!(
-            "weights: expected {} params, got {}",
-            model.num_params(),
-            global.len()
-        ));
-    }
+struct Round<'a> {
+    client: &'a Client,
+    worker_id: &'a str,
+    task: &'a Task,
+    train: &'a dti_protocol::TrainConfig,
+    graph: &'a nn::Graph,
+}
 
-    let data = client.get(&format!(
-        "/v1/data/{}/{}",
-        task.shard.offset, task.shard.len
-    ))?;
-    expect_status(&data, 200, "data")?;
-    let data = data.body;
-    let window = (train.batch_tokens as usize).min(data.len());
-    if window < 2 {
-        return Err("shard too small to train on".into());
-    }
-
-    let mut params = global.clone();
-    let mut rng = Rng::new(task.seed);
-    let report_every = (train.inner_steps / 10).max(1);
-    for step in 0..train.inner_steps {
-        let start = rng.below((data.len() - window + 1) as u64) as usize;
-        let loss = model.loss_and_grad(&params, &data[start..start + window], grad)?;
-        opt.step(&mut params, grad, train.inner_lr);
-        if step % report_every == 0 || step + 1 == train.inner_steps {
-            telemetry::step(telemetry::StepMetrics {
-                round: task.round,
-                step: step + 1,
-                inner_steps: train.inner_steps,
-                loss,
-            });
+impl Round<'_> {
+    /// Trains one round and sends the update. `Ok(false)` if there was no
+    /// data left to train on.
+    fn train(&self, data: &mut Data, opt: &mut AdamW, grad: &mut [f32]) -> Result<bool, String> {
+        let (client, round) = (self.client, self.task.round);
+        let weights = client.get(&format!("/v1/weights/{round}"))?;
+        if weights.status == 409 {
+            return Err("round moved on before we fetched weights".into());
         }
-    }
+        expect_status(&weights, 200, "weights")?;
+        let global = decode_f32s(&weights.body).map_err(|e| format!("weights: {e}"))?;
+        if global.len() != self.graph.num_params() {
+            return Err(format!(
+                "weights: expected {} params, got {}",
+                self.graph.num_params(),
+                global.len()
+            ));
+        }
 
-    let delta: Vec<f32> = global.iter().zip(&params).map(|(g, l)| g - l).collect();
-    let body = encode_update(&delta);
-    let sent = client.post(
-        &format!("/v1/update/{worker_id}/{}", task.round),
-        "application/octet-stream",
-        &body,
-    )?;
-    if sent.status == 409 {
-        return Err("update arrived after the round closed".into());
-    }
-    expect_status(&sent, 202, "update")?;
-    telemetry::round_finished(task.round, body.len() as u64);
-    Ok(())
-}
-
-/// Where the forward and backward passes of local training run.
-enum Compute {
-    /// `dti-model`'s Rust code, inside this wasm.
-    Wasm(Box<dyn Model>),
-    /// A TorchScript graph the runner executes through `wasi:nn`.
-    #[cfg(feature = "nn")]
-    Graph(nn::Graph),
-}
-
-impl Compute {
-    /// Uses the runner's `wasi:nn` graph named after the model when there is
-    /// one, and the Rust model otherwise.
-    fn new(spec: ModelSpec) -> Self {
-        let model = dti_model::build(spec);
-        #[cfg(feature = "nn")]
-        {
-            let name = spec.to_string();
-            match nn::Graph::load(&name, model.num_params()) {
-                Ok(graph) => {
-                    telemetry::log(&format!("training steps run in wasi:nn graph {name:?}"));
-                    return Compute::Graph(graph);
-                }
-                Err(e) => telemetry::log(&format!("{e}; training in wasm instead")),
+        let mut params = global.clone();
+        let inner_steps = self.train.inner_steps;
+        let report_every = (inner_steps / 10).max(1);
+        let mut tokens = 0u64;
+        let mut steps = 0;
+        while steps < inner_steps {
+            let Some(batch) = data.next_batch(self.train.batch_tokens as usize)? else {
+                break;
+            };
+            let loss = self.graph.loss_and_grad(&params, batch, grad)?;
+            opt.step(&mut params, grad, self.train.inner_lr);
+            tokens += batch.len() as u64;
+            steps += 1;
+            if (steps - 1) % report_every == 0 || steps == inner_steps {
+                telemetry::step(telemetry::StepMetrics {
+                    round,
+                    step: steps,
+                    inner_steps,
+                    loss,
+                });
             }
         }
-        Compute::Wasm(model)
-    }
-
-    fn num_params(&self) -> usize {
-        match self {
-            Compute::Wasm(model) => model.num_params(),
-            #[cfg(feature = "nn")]
-            Compute::Graph(graph) => graph.num_params(),
+        if steps == 0 {
+            return Ok(false);
         }
-    }
 
-    fn loss_and_grad(
-        &self,
-        params: &[f32],
-        tokens: &[u8],
-        grad: &mut [f32],
-    ) -> Result<f32, String> {
-        match self {
-            Compute::Wasm(model) => Ok(model.loss_and_grad(params, tokens, grad)),
-            #[cfg(feature = "nn")]
-            Compute::Graph(graph) => graph.loss_and_grad(params, tokens, grad),
+        let delta: Vec<f32> = global.iter().zip(&params).map(|(g, l)| g - l).collect();
+        let body = encode_update(&delta);
+        let sent = client.post(
+            &format!("/v1/update/{}/{round}?tokens={tokens}", self.worker_id),
+            "application/octet-stream",
+            &body,
+        )?;
+        if sent.status == 409 {
+            return Err("update arrived after the round closed".into());
         }
+        expect_status(&sent, 202, "update")?;
+        telemetry::round_finished(round, body.len() as u64);
+
+        let done = data.commit();
+        if !done.is_empty() {
+            let ids = serde_json::to_vec(&done).map_err(|e| e.to_string())?;
+            // If this is lost, the coordinator leases the slices again later.
+            match client.post(
+                &format!("/v1/done/{}", self.worker_id),
+                "application/json",
+                &ids,
+            ) {
+                Ok(r) if r.status == 204 => {}
+                Ok(r) => telemetry::log(&format!("reporting finished slices: HTTP {}", r.status)),
+                Err(e) => telemetry::log(&format!("reporting finished slices: {e}")),
+            }
+        }
+        Ok(true)
     }
 }
 

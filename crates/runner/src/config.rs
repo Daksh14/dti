@@ -6,8 +6,12 @@ use wasmtime::bail;
 use wasmtime::error::Context;
 
 const DEFAULT_MAX_MEMORY_MB: u64 = 1024;
+const DEFAULT_DATA_GB: f64 = 1.0;
+/// Hugging Face, and the CDN its `resolve` URLs redirect to.
+const DEFAULT_DATA_ORIGINS: [&str; 2] = ["https://huggingface.co", "https://*.hf.co"];
 
-/// Run a dti training worker in a sandbox that can only reach its coordinator.
+/// Run a dti training worker in a sandbox that can only reach its coordinator
+/// and the data origins you allow, and can only train with your TorchScript graphs.
 #[derive(Parser)]
 #[command(version)]
 pub struct Cli {
@@ -18,13 +22,28 @@ pub struct Cli {
     #[arg(long)]
     pub config: Option<PathBuf>,
 
-    /// Coordinator URL, the only destination the worker may reach.
+    /// Coordinator URL.
     #[arg(long)]
     pub coordinator: Option<String>,
+
+    /// How much training data to download, in GB. This sets how long you
+    /// train: every downloaded byte is trained on once.
+    #[arg(long)]
+    pub data_gb: Option<f64>,
+
+    /// Origin the worker may download training data from, e.g.
+    /// `https://huggingface.co` or `https://*.hf.co`. Repeat for several;
+    /// replaces the config's list.
+    #[arg(long = "data-origin")]
+    pub data_origins: Vec<String>,
 
     /// Cap on the worker's linear memory, in MiB.
     #[arg(long)]
     pub max_memory_mb: Option<u64>,
+
+    /// CPU threads libtorch may use (default: libtorch's choice).
+    #[arg(long)]
+    pub torch_threads: Option<usize>,
 
     /// Refuse to start unless the wasm file has this SHA-256 (hex).
     #[arg(long)]
@@ -35,7 +54,10 @@ pub struct Cli {
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct FileConfig {
     coordinator: Option<String>,
+    data_gb: Option<f64>,
+    data_origins: Option<Vec<String>>,
     max_memory_mb: Option<u64>,
+    torch_threads: Option<usize>,
     gpu_memory_mb: Option<u64>,
     expected_sha256: Option<String>,
     #[serde(default)]
@@ -68,10 +90,6 @@ pub enum Target {
 pub struct Graph {
     pub name: String,
     pub path: PathBuf,
-    #[cfg_attr(
-        not(feature = "pytorch"),
-        expect(dead_code, reason = "checked when loading")
-    )]
     pub sha256: String,
     pub target: Target,
 }
@@ -79,7 +97,11 @@ pub struct Graph {
 pub struct Config {
     pub wasm: PathBuf,
     pub coordinator: String,
+    /// Most bytes the worker may download from `data_origins`.
+    pub data_budget: u64,
+    pub data_origins: Vec<String>,
     pub max_memory_mb: u64,
+    pub torch_threads: Option<usize>,
     /// Accepted so config files can carry it, but not enforced: `wasi:nn`
     /// graphs on the GPU are not limited yet.
     pub gpu_memory_mb: Option<u64>,
@@ -103,11 +125,18 @@ impl Config {
         if max_memory_mb == 0 {
             bail!("max-memory-mb must be greater than zero");
         }
-        if !file.graphs.is_empty() && !cfg!(feature = "pytorch") {
-            bail!(
-                "the config lists [graphs] but this runner was built without PyTorch; \
-                 rebuild it with `cargo build --release --features pytorch`"
-            );
+        let data_gb = cli.data_gb.or(file.data_gb).unwrap_or(DEFAULT_DATA_GB);
+        if !(data_gb.is_finite() && data_gb > 0.0) {
+            bail!("data-gb must be a positive number of gigabytes");
+        }
+        let data_origins = if cli.data_origins.is_empty() {
+            file.data_origins
+                .unwrap_or_else(|| DEFAULT_DATA_ORIGINS.map(String::from).to_vec())
+        } else {
+            cli.data_origins
+        };
+        if cli.torch_threads.or(file.torch_threads) == Some(0) {
+            bail!("torch-threads must be greater than zero");
         }
         // Graph paths are relative to the config file.
         let base = cli
@@ -128,7 +157,10 @@ impl Config {
         Ok(Self {
             wasm: cli.wasm,
             coordinator,
+            data_budget: (data_gb * 1e9) as u64,
+            data_origins,
             max_memory_mb,
+            torch_threads: cli.torch_threads.or(file.torch_threads),
             gpu_memory_mb: file.gpu_memory_mb,
             expected_sha256: cli
                 .expect_sha256

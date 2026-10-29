@@ -1,11 +1,23 @@
 # Config for dti-runner: `dti-runner --config dti.toml <worker.wasm>`.
 # Command-line flags override these values.
 
-# The only destination the worker is allowed to reach.
 coordinator = "https://coordinator.example.com"
+
+# How much training data to download, in GB. The worker trains on every byte
+# once, so this sets how much CPU/GPU time you give. The runner cuts off data
+# downloads at this amount, whatever the worker or the coordinator asks for.
+data-gb = 1.0
+
+# Where the worker may download data from, besides the coordinator. The
+# default is Hugging Face and the CDN its downloads redirect to; `*.` matches
+# subdomains.
+# data-origins = ["https://huggingface.co", "https://*.hf.co"]
 
 # Cap on the worker's linear memory, in MiB.
 max-memory-mb = 1024
+
+# CPU threads libtorch may use (default: libtorch's choice).
+# torch-threads = 4
 
 # Accepted but not enforced yet. The only GPU access is through wasi:nn
 # graphs with target = "gpu" below, and their GPU memory is not limited.
@@ -14,13 +26,12 @@ gpu-memory-mb = 0
 # Refuse to start unless the worker wasm has this SHA-256.
 # expected-sha256 = "..."
 
-# TorchScript graphs the worker may run through wasi:nn, by name. Needs a
-# worker built with `cargo build-worker-nn` and a runner built with
-# `--features pytorch`. A graph runs as native code in the runner, outside the
-# sandbox, so its SHA-256 is required. Paths are relative to this file.
-# Export one with `python graphs/export.py byte-bigram byte-bigram.pt`.
-#
-# [graphs.byte-bigram]
-# path = "byte-bigram.pt"
-# sha256 = "..."
-# target = "cpu"   # or "gpu" (CUDA device 0)
+# TorchScript graphs the worker trains with through wasi:nn, by name; it needs
+# the one named after the run's model. A graph runs as native code in the
+# runner, outside the sandbox, so its SHA-256 is required. Paths are relative
+# to this file. `python graphs/export.py byte-bigram byte-bigram.pt` prints
+# this entry.
+[graphs.byte-bigram]
+path = "byte-bigram.pt"
+sha256 = "..."
+target = "cpu"   # or "gpu" (CUDA device 0)

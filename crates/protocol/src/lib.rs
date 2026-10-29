@@ -36,6 +36,8 @@ pub struct RunInfo {
     pub model: ModelSpec,
     pub num_params: u64,
     pub train: TrainConfig,
+    /// Where the training data comes from, for display.
+    pub data: String,
 }
 
 /// `POST /v1/join`
@@ -45,21 +47,73 @@ pub struct JoinResponse {
     pub run: RunInfo,
 }
 
-/// A byte range of the training corpus, fetched with `GET /v1/data/{offset}/{len}`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct Shard {
-    pub offset: u64,
-    pub len: u64,
-}
-
-/// `GET /v1/task/{worker_id}`: what to train on for the current round.
+/// `GET /v1/task/{worker_id}`: the round to train next (410 when the run is over).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub round: u64,
-    pub shard: Shard,
-    /// Seeds batch sampling, so the coordinator can replay a worker's steps
-    /// when spot-checking it.
-    pub seed: u64,
+}
+
+/// `POST /v1/slice/{worker_id}`: lease the next slice of training data that
+/// fits in what is left of the volunteer's data budget.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SliceRequest {
+    pub max_bytes: u64,
+}
+
+/// A piece of the training data, leased to one worker at a time. Workers
+/// train on every byte of text in a slice once, in order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Slice {
+    pub id: u64,
+    /// What the worker downloads for it; this counts toward its data budget.
+    pub bytes: u64,
+    pub source: Source,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum Source {
+    /// Raw text from the coordinator: `GET /v1/data/{offset}/{len}`.
+    Corpus { offset: u64, len: u64 },
+    /// One parquet row group's text column, downloaded with a range request.
+    Parquet(ParquetChunk),
+}
+
+/// Where one column chunk of strings sits in a parquet file and how to decode
+/// it. The coordinator reads this from the file's footer, so workers download
+/// only the chunk itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParquetChunk {
+    pub url: String,
+    /// Byte range of the column chunk within the file.
+    pub offset: u64,
+    pub len: u64,
+    /// Where the first data page starts, relative to `offset`. Anything before
+    /// it is the dictionary page.
+    pub data_page_offset: u64,
+    /// Number of rows, including nulls.
+    pub num_values: u64,
+    /// Whether the column is `optional` (has definition levels).
+    pub nullable: bool,
+    pub codec: Codec,
+    /// Rows to train on, one bit per row, least significant bit first. The
+    /// coordinator's filters decide these; `None` means every row.
+    pub keep: Option<Vec<u8>>,
+}
+
+/// Parquet page compression a worker can decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Codec {
+    Uncompressed,
+    Snappy,
+}
+
+/// Query string of `POST /v1/update/{worker_id}/{round}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateInfo {
+    /// Tokens the update was trained on.
+    pub tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -7,11 +7,12 @@ members = [
     "crates/runner",
     "crates/coordinator",
 ]
-# The worker only builds for wasm32-wasip2; build it with `cargo build-worker`.
+# The worker only builds for wasm32-wasip2 (`cargo build-worker`), and the
+# runner needs libtorch (`cargo build-runner`), so plain `cargo build` and
+# `cargo test` cover the rest.
 default-members = [
     "crates/protocol",
     "crates/model",
-    "crates/runner",
     "crates/coordinator",
 ]
 

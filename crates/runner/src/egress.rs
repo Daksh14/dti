@@ -1,36 +1,53 @@
-//! The worker's only route to the network: `wasi:http` requests to one origin.
+//! The worker's only route to the network: `wasi:http` requests to the
+//! coordinator and to the volunteer's data origins.
 //!
 //! Raw `wasi:sockets` stay disabled (the `WasiCtx` default), so this hook is
-//! the single place outbound traffic is allowed, refused and counted.
+//! the single place outbound traffic is allowed, refused and counted. It also
+//! enforces the data budget: successful responses from data origins stop once
+//! their bodies add up to it.
 
 use bytes::Bytes;
 use http::Uri;
 use http::uri::Scheme;
-use http_body::Body;
+use http_body::{Body, Frame};
 use http_body_util::BodyExt;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::task::{Context as TaskContext, Poll, ready};
 use wasmtime::bail;
 use wasmtime::error::Context;
 use wasmtime_wasi_http::{Error, RequestOptions, WasiBody, WasiHttpHooks};
 
-/// Scheme, host and port the worker may talk to.
+/// Scheme, host and port the worker may talk to. A host written `*.example.com`
+/// matches every subdomain of `example.com`, but not `example.com` itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Origin {
     https: bool,
     host: String,
     port: u16,
+    subdomains: bool,
 }
 
 impl Origin {
     pub fn parse(url: &str) -> wasmtime::Result<Self> {
-        let uri = url
+        let (plain, subdomains) = match url.split_once("://*.") {
+            Some((scheme, rest)) => (format!("{scheme}://{rest}"), true),
+            None => (url.to_string(), false),
+        };
+        let uri = plain
             .parse::<Uri>()
-            .with_context(|| format!("invalid coordinator URL {url:?}"))?;
-        match Self::of(&uri) {
-            Some(origin) => Ok(origin),
-            None => bail!("coordinator URL must be http:// or https:// with a host: {url:?}"),
+            .with_context(|| format!("invalid URL {url:?}"))?;
+        let Some(origin) = Self::of(&uri) else {
+            bail!("expected http:// or https:// with a host: {url:?}");
+        };
+        if subdomains && !uri.path().trim_end_matches('/').is_empty() {
+            bail!("a wildcard origin cannot have a path: {url:?}");
         }
+        Ok(Self {
+            subdomains,
+            ..origin
+        })
     }
 
     fn of(uri: &Uri) -> Option<Self> {
@@ -45,7 +62,12 @@ impl Origin {
             return None;
         }
         let port = authority.port_u16().unwrap_or(if https { 443 } else { 80 });
-        Some(Self { https, host, port })
+        Some(Self {
+            https,
+            host,
+            port,
+            subdomains: false,
+        })
     }
 
     pub fn is_https(&self) -> bool {
@@ -53,7 +75,17 @@ impl Origin {
     }
 
     pub fn allows(&self, uri: &Uri) -> bool {
-        Self::of(uri).is_some_and(|o| o == *self)
+        Self::of(uri).is_some_and(|o| {
+            o.https == self.https
+                && o.port == self.port
+                && if self.subdomains {
+                    o.host
+                        .strip_suffix(&self.host)
+                        .is_some_and(|sub| sub.len() > 1 && sub.ends_with('.'))
+                } else {
+                    o.host == self.host
+                }
+        })
     }
 }
 
@@ -63,10 +95,23 @@ pub struct NetStats {
     pub denied: AtomicU64,
     pub bytes_up: AtomicU64,
     pub bytes_down: AtomicU64,
+    /// Bytes of successful responses from data origins; capped by the budget.
+    pub data_down: AtomicU64,
 }
 
+type SendFuture = Box<
+    dyn Future<
+            Output = wasmtime_wasi_http::Result<(
+                http::Response<WasiBody>,
+                Box<dyn Future<Output = Result<(), Error>> + Send>,
+            )>,
+        > + Send,
+>;
+
 pub struct Egress {
-    pub allowed: Origin,
+    pub coordinator: Origin,
+    pub data: Vec<Origin>,
+    pub data_budget: u64,
     pub stats: Arc<NetStats>,
 }
 
@@ -76,28 +121,53 @@ impl WasiHttpHooks for Egress {
         request: http::Request<WasiBody>,
         options: Option<RequestOptions>,
         fut: Box<dyn Future<Output = Result<(), Error>> + Send>,
-    ) -> Box<
-        dyn Future<
-                Output = wasmtime_wasi_http::Result<(
-                    http::Response<WasiBody>,
-                    Box<dyn Future<Output = Result<(), Error>> + Send>,
-                )>,
-            > + Send,
-    > {
+    ) -> SendFuture {
         _ = fut;
-        if !self.allowed.allows(request.uri()) {
-            self.stats.denied.fetch_add(1, Relaxed);
-            println!("[net]    DENIED {} {}", request.method(), request.uri());
-            return Box::new(async { Err(Error::HttpRequestDenied) });
+        let uri = request.uri();
+        let is_data = if self.coordinator.allows(uri) {
+            false
+        } else if self.data.iter().any(|o| o.allows(uri)) {
+            true
+        } else {
+            return self.deny(&request, "");
+        };
+        if is_data && self.stats.data_down.load(Relaxed) >= self.data_budget {
+            return self.deny(&request, " (data budget used up)");
         }
         self.stats.requests.fetch_add(1, Relaxed);
         let stats = self.stats.clone();
+        let budget = self.data_budget;
         let request = request.map(|body| counted(body, stats.clone(), |s| &s.bytes_up));
         Box::new(async move {
             let (response, io) = wasmtime_wasi_http::default_send_request(request, options).await?;
-            let response = response.map(|body| counted(body, stats, |s| &s.bytes_down));
+            let capped = is_data && response.status().is_success();
+            let response = response.map(|body| {
+                let body = counted(body, stats.clone(), |s| &s.bytes_down);
+                if capped {
+                    Capped {
+                        inner: body,
+                        stats,
+                        budget,
+                    }
+                    .boxed_unsync()
+                } else {
+                    body
+                }
+            });
             Ok((response, Box::new(io) as Box<dyn Future<Output = _> + Send>))
         })
+    }
+}
+
+impl Egress {
+    fn deny(&self, request: &http::Request<WasiBody>, why: &str) -> SendFuture {
+        self.stats.denied.fetch_add(1, Relaxed);
+        println!(
+            "[net]    DENIED {} {}{why}",
+            request.method(),
+            request.uri()
+        );
+        Box::new(async { Err(Error::HttpRequestDenied) })
     }
 }
 
@@ -112,6 +182,45 @@ where
         frame
     })
     .boxed_unsync()
+}
+
+/// A data response body that fails once all data downloads together pass the
+/// budget, whatever sizes the worker or the coordinator claimed.
+struct Capped {
+    inner: WasiBody,
+    stats: Arc<NetStats>,
+    budget: u64,
+}
+
+impl Body for Capped {
+    type Data = Bytes;
+    type Error = Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+        let frame = ready!(Pin::new(&mut self.inner).poll_frame(cx));
+        if let Some(Ok(f)) = &frame
+            && let Some(data) = f.data_ref()
+        {
+            let len = data.len() as u64;
+            let total = self.stats.data_down.fetch_add(len, Relaxed) + len;
+            if total > self.budget {
+                println!("[net]    data budget used up; cutting off a download");
+                return Poll::Ready(Some(Err(Error::HttpResponseBodySize(None))));
+            }
+        }
+        Poll::Ready(frame)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 #[cfg(test)]
@@ -131,6 +240,7 @@ mod tests {
         assert!(!allows(c, "https://coordinator.example.com:8443/"));
         assert!(!allows(c, "https://pool.example.net/"));
         assert!(!allows(c, "https://coordinator.example.com.evil.net/"));
+        assert!(!allows(c, "https://sub.coordinator.example.com/"));
         assert!(!allows(c, "/relative/path"));
 
         let local = "http://127.0.0.1:8080";
@@ -140,8 +250,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unusable_coordinator_urls() {
+    fn wildcards_match_subdomains_only() {
+        let cdn = "https://*.hf.co";
+        assert!(allows(cdn, "https://us.aws.cdn.hf.co/xet-bridge-us/abc"));
+        assert!(allows(cdn, "https://cdn-lfs.hf.co/x"));
+        assert!(!allows(cdn, "https://hf.co/x"));
+        assert!(!allows(cdn, "https://evilhf.co/x"));
+        assert!(!allows(cdn, "https://cdn.hf.co.evil.net/x"));
+        assert!(!allows(cdn, "http://cdn-lfs.hf.co/x"));
+        assert!(!allows(cdn, "https://cdn-lfs.hf.co:8443/x"));
+    }
+
+    #[test]
+    fn rejects_unusable_urls() {
         assert!(Origin::parse("ftp://example.com").is_err());
         assert!(Origin::parse("example.com").is_err());
+        assert!(Origin::parse("https://*.hf.co/some/path").is_err());
     }
 }

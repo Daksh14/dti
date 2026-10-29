@@ -1,4 +1,4 @@
-//! `wasi:nn` for workers built with `--features nn`, backed by PyTorch.
+//! `wasi:nn` for the worker, backed by PyTorch: the worker's only way to train.
 //!
 //! The worker can only `load-by-name` the graphs listed in the config, which
 //! the runner reads and hash-checks itself. `load` from guest-supplied bytes is
@@ -14,6 +14,9 @@ use crate::config::{Graph, Target};
 use crate::hex;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::time::Instant;
 use wasmtime::error::Context;
 use wasmtime::{bail, format_err};
 use wasmtime_wasi_nn::backend::pytorch::PytorchBackend;
@@ -23,8 +26,9 @@ use wasmtime_wasi_nn::backend::{
 use wasmtime_wasi_nn::wit::{ExecutionTarget, TensorType, WasiNnCtx};
 use wasmtime_wasi_nn::{ExecutionContext, GraphRegistry, Registry, Tensor};
 
-/// Reads, checks and loads every configured graph.
-pub fn load(graphs: &[Graph]) -> wasmtime::Result<WasiNnCtx> {
+/// Reads, checks and loads every configured graph. Time spent computing in
+/// them is added to `torch_nanos`.
+pub fn load(graphs: &[Graph], torch_nanos: Arc<AtomicU64>) -> wasmtime::Result<WasiNnCtx> {
     let mut backend = PytorchBackend::default();
     let mut loaded = Graphs::default();
     for graph in graphs {
@@ -57,7 +61,10 @@ pub fn load(graphs: &[Graph]) -> wasmtime::Result<WasiNnCtx> {
             .load(&[&bytes], target)
             .map_err(|e| format_err!("{e}: {}", source(&e)))
             .with_context(|| format!("loading graph {:?} with PyTorch", graph.name))?;
-        let checked: Box<dyn BackendGraph> = Box::new(Checked(pytorch));
+        let checked: Box<dyn BackendGraph> = Box::new(Checked {
+            inner: pytorch,
+            torch_nanos: torch_nanos.clone(),
+        });
         loaded.0.insert(graph.name.clone(), checked.into());
     }
     Ok(WasiNnCtx::new(Vec::new(), Registry::from(loaded)))
@@ -76,13 +83,19 @@ impl GraphRegistry for Graphs {
     }
 }
 
-/// A graph whose execution contexts check every input tensor.
-struct Checked<T>(T);
+/// A graph whose execution contexts check every input tensor and time their
+/// computations.
+struct Checked<T> {
+    inner: T,
+    torch_nanos: Arc<AtomicU64>,
+}
 
 impl BackendGraph for Checked<wasmtime_wasi_nn::Graph> {
     fn init_execution_context(&self) -> Result<ExecutionContext, BackendError> {
-        let ctx: Box<dyn BackendExecutionContext> =
-            Box::new(Checked(self.0.init_execution_context()?));
+        let ctx: Box<dyn BackendExecutionContext> = Box::new(Checked {
+            inner: self.inner.init_execution_context()?,
+            torch_nanos: self.torch_nanos.clone(),
+        });
         Ok(ctx.into())
     }
 }
@@ -90,22 +103,25 @@ impl BackendGraph for Checked<wasmtime_wasi_nn::Graph> {
 impl BackendExecutionContext for Checked<ExecutionContext> {
     fn set_input(&mut self, id: Id, tensor: &Tensor) -> Result<(), BackendError> {
         check(tensor)?;
-        self.0.set_input(id, tensor)
+        self.inner.set_input(id, tensor)
     }
 
     fn get_output(&mut self, id: Id) -> Result<Tensor, BackendError> {
-        self.0.get_output(id)
+        self.inner.get_output(id)
     }
 
     fn compute(
         &mut self,
         inputs: Option<Vec<NamedTensor>>,
     ) -> Result<Option<Vec<NamedTensor>>, BackendError> {
+        let started = Instant::now();
         let result = inputs
             .iter()
             .flatten()
             .try_for_each(|input| check(&input.tensor))
-            .and_then(|()| BackendExecutionContext::compute(&mut *self.0, inputs));
+            .and_then(|()| BackendExecutionContext::compute(&mut *self.inner, inputs));
+        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.torch_nanos.fetch_add(nanos, Relaxed);
         // The guest only gets "Failed while accessing backend", so show why here.
         if let Err(e) = &result {
             println!("[nn]     compute failed: {}", source(e));

@@ -1,24 +1,30 @@
-//! Coordinates a DiLoCo training run: hands out data shards, collects
-//! compressed pseudo-gradients from workers, combines them robustly and
-//! applies the outer optimiser step.
+//! Coordinates a DiLoCo training run: leases slices of training data to
+//! workers, collects compressed pseudo-gradients from them, combines them
+//! robustly and applies the outer optimiser step.
+//!
+//! Workers download their slices themselves and train on as much data as
+//! their volunteers' budgets allow; what is trained on, how updates are
+//! filtered and combined, and the optimiser all live here.
 //!
 //! This is a single trusted coordinator. Splitting it across independent
 //! aggregators that agree on each round's result is future work.
 
 mod aggregate;
+mod data;
 
 use aggregate::{Nesterov, l2, robust_mean};
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
+use data::{Ledger, Plan, corpus_slices};
 use dti_model::Model;
 use dti_protocol::{
-    JoinResponse, ModelSpec, RunInfo, Shard, Task, TrainConfig, decode_update, encode_f32s,
-    update_len,
+    JoinResponse, ModelSpec, RunInfo, SliceRequest, Task, TrainConfig, UpdateInfo, decode_update,
+    encode_f32s, update_len,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -35,9 +41,12 @@ const VAL_BYTES: usize = 64 << 10;
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
-    /// Training text. The model is byte-level, so any file works.
+    /// Training text served by the coordinator. The model is byte-level, so any file works.
+    #[arg(long, required_unless_present = "dataset", conflicts_with = "dataset")]
+    corpus: Option<PathBuf>,
+    /// A dataset plan from `data/plan.py`; workers download its slices themselves.
     #[arg(long)]
-    corpus: PathBuf,
+    dataset: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
     /// Close a round as soon as this many workers have sent updates.
@@ -46,8 +55,12 @@ struct Cli {
     /// Close a round after this long if at least one update has arrived.
     #[arg(long, default_value_t = 120)]
     round_timeout_secs: u64,
-    #[arg(long, default_value_t = 30)]
-    rounds: u64,
+    /// Stop after this many rounds; by default the run ends when the data does.
+    #[arg(long)]
+    rounds: Option<u64>,
+    /// Passes over the training data.
+    #[arg(long, default_value_t = 1)]
+    epochs: u32,
     #[arg(long, default_value_t = 100)]
     inner_steps: u32,
     #[arg(long, default_value_t = 512)]
@@ -64,8 +77,13 @@ struct Cli {
     /// Fraction of updates dropped from each end, per coordinate.
     #[arg(long, default_value_t = 0.2)]
     trim_fraction: f32,
+    /// Size of each slice of `--corpus`.
     #[arg(long, default_value_t = 64 << 10)]
-    shard_bytes: u64,
+    slice_bytes: u64,
+    /// Put a worker's unfinished slices back in the pool after this long
+    /// without hearing from it. Must be longer than a round takes.
+    #[arg(long, default_value_t = 1800)]
+    lease_secs: u64,
     /// Write the final weights (raw little-endian f32) here when the run ends.
     #[arg(long)]
     out: Option<PathBuf>,
@@ -74,13 +92,15 @@ struct Cli {
 struct Coordinator {
     run: RunInfo,
     model: Box<dyn Model>,
+    /// Text served by `GET /v1/data`; empty for a dataset plan.
     train: Arc<[u8]>,
     val: Vec<u8>,
-    shard_bytes: u64,
+    ledger: Ledger,
     min_workers: usize,
-    rounds: u64,
+    rounds: Option<u64>,
     trim_fraction: f32,
     round_timeout: Duration,
+    lease: Duration,
     out: Option<PathBuf>,
 
     params: Vec<f32>,
@@ -89,9 +109,11 @@ struct Coordinator {
     weights: Bytes,
     round: u64,
     round_started: Instant,
-    /// Worker id → index, used to spread workers over different shards.
-    workers: HashMap<String, u64>,
+    /// Worker id → when it last contacted us.
+    workers: HashMap<String, Instant>,
     updates: BTreeMap<String, Vec<f32>>,
+    /// Bytes of data in slices that are done.
+    trained_bytes: u64,
     val_loss: f32,
     finished: bool,
 }
@@ -101,10 +123,23 @@ type Shared = Arc<Mutex<Coordinator>>;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let corpus = std::fs::read(&cli.corpus)?;
-    anyhow::ensure!(corpus.len() >= 1024, "corpus is too small to train on");
-    let (train, val) = split_corpus(&corpus);
-    let (train, val) = (train.as_slice(), val.as_slice());
+    let (train, val, slices, source) = match (&cli.corpus, &cli.dataset) {
+        (Some(corpus), _) => {
+            let text = std::fs::read(corpus)?;
+            anyhow::ensure!(text.len() >= 1024, "corpus is too small to train on");
+            let (train, val) = split_corpus(&text);
+            let slices = corpus_slices(train.len() as u64, cli.slice_bytes.max(2));
+            (train, val, slices, corpus.display().to_string())
+        }
+        (None, Some(path)) => {
+            let (plan, val) = Plan::load(path)?;
+            (Vec::new(), val, plan.slices, plan.source)
+        }
+        (None, None) => unreachable!("clap requires --corpus or --dataset"),
+    };
+    let val = val[..val.len().min(VAL_BYTES)].to_vec();
+    let total_bytes: u64 = slices.iter().map(|s| s.bytes).sum::<u64>() * u64::from(cli.epochs);
+    let ledger = Ledger::new(slices, cli.epochs.max(1));
 
     let spec = ModelSpec::ByteBigram;
     let model = dti_model::build(spec);
@@ -126,47 +161,54 @@ async fn main() -> anyhow::Result<()> {
                 inner_lr: cli.inner_lr,
                 weight_decay: cli.weight_decay,
             },
+            data: source,
         },
-        val_loss: model.loss(&params, val),
+        val_loss: model.loss(&params, &val),
         outer: Nesterov::new(params.len(), cli.outer_lr, cli.outer_momentum),
         weights: Bytes::from(encode_f32s(&params)),
         params,
         model,
         train: train.into(),
-        val: val.to_vec(),
-        shard_bytes: cli.shard_bytes.max(2),
+        val,
+        ledger,
         min_workers: cli.min_workers.max(1),
         rounds: cli.rounds,
         trim_fraction: cli.trim_fraction,
         round_timeout: Duration::from_secs(cli.round_timeout_secs),
+        lease: Duration::from_secs(cli.lease_secs),
         out: cli.out,
         round: 0,
         round_started: Instant::now(),
         workers: HashMap::new(),
         updates: BTreeMap::new(),
+        trained_bytes: 0,
         finished: false,
     };
-    coord.finished = coord.rounds == 0;
+    coord.finished = coord.rounds == Some(0);
 
     println!(
-        "{}: model {} ({} params), {} train / {} val bytes, {} rounds × {} inner steps",
+        "{}: model {} ({} params), data {}: {} slices, {} over {} epoch(s), {} val bytes, {} inner steps per round",
         coord.run.run_id,
         coord.run.model,
         coord.run.num_params,
-        coord.train.len(),
+        coord.run.data,
+        coord.ledger.len(),
+        bytes(total_bytes),
+        cli.epochs.max(1),
         coord.val.len(),
-        coord.rounds,
         coord.run.train.inner_steps,
     );
     println!("round 0: val loss {:.4}", coord.val_loss);
 
     let max_body = update_len(coord.params.len()) + 1024;
     let state: Shared = Arc::new(Mutex::new(coord));
-    tokio::spawn(close_stale_rounds(state.clone()));
+    tokio::spawn(housekeeping(state.clone()));
 
     let app = Router::new()
         .route("/v1/join", post(join))
         .route("/v1/task/{worker}", get(task))
+        .route("/v1/slice/{worker}", post(slice))
+        .route("/v1/done/{worker}", post(done))
         .route("/v1/weights/{round}", get(weights))
         .route("/v1/data/{offset}/{len}", get(data))
         .route("/v1/update/{worker}/{round}", post(update))
@@ -182,9 +224,8 @@ async fn main() -> anyhow::Result<()> {
 
 async fn join(State(state): State<Shared>) -> Json<JoinResponse> {
     let mut c = state.lock().unwrap();
-    let index = c.workers.len() as u64;
-    let worker_id = format!("w{}", index + 1);
-    c.workers.insert(worker_id.clone(), index);
+    let worker_id = format!("w{}", c.workers.len() + 1);
+    c.workers.insert(worker_id.clone(), Instant::now());
     println!("{worker_id} joined ({} workers)", c.workers.len());
     Json(JoinResponse {
         worker_id,
@@ -193,29 +234,52 @@ async fn join(State(state): State<Shared>) -> Json<JoinResponse> {
 }
 
 async fn task(State(state): State<Shared>, Path(worker): Path<String>) -> Response {
-    let c = state.lock().unwrap();
-    let Some(&index) = c.workers.get(&worker) else {
+    let mut c = state.lock().unwrap();
+    if !c.seen(&worker) {
         return (StatusCode::NOT_FOUND, "unknown worker").into_response();
-    };
+    }
     if c.finished {
         return (StatusCode::GONE, "run finished").into_response();
     }
-    let num_shards = (c.train.len() as u64 / c.shard_bytes).max(1);
-    // Different workers get different shards within a round; the offset
-    // rotates which shard each worker sees from round to round.
-    let shard = (index + c.round * 7919) % num_shards;
-    let offset = shard * c.shard_bytes;
-    let len = if shard + 1 == num_shards {
-        c.train.len() as u64 - offset
-    } else {
-        c.shard_bytes
-    };
-    Json(Task {
-        round: c.round,
-        shard: Shard { offset, len },
-        seed: splitmix(c.round << 32 | index),
-    })
-    .into_response()
+    Json(Task { round: c.round }).into_response()
+}
+
+/// Leases the worker its next slice, or 204 if none fits in its budget.
+async fn slice(
+    State(state): State<Shared>,
+    Path(worker): Path<String>,
+    Json(req): Json<SliceRequest>,
+) -> Response {
+    let mut c = state.lock().unwrap();
+    if !c.seen(&worker) {
+        return (StatusCode::NOT_FOUND, "unknown worker").into_response();
+    }
+    if c.finished {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    match c.ledger.lease(&worker, req.max_bytes) {
+        Some(slice) => Json(slice).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+/// The worker has trained on all of these slices and its update was accepted.
+async fn done(
+    State(state): State<Shared>,
+    Path(worker): Path<String>,
+    Json(ids): Json<Vec<u64>>,
+) -> Response {
+    let mut c = state.lock().unwrap();
+    if !c.seen(&worker) {
+        return (StatusCode::NOT_FOUND, "unknown worker").into_response();
+    }
+    for id in ids {
+        if let Some(bytes) = c.ledger.done(&worker, id) {
+            c.trained_bytes += bytes;
+        }
+    }
+    c.finish_if_data_done();
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn weights(State(state): State<Shared>, Path(round): Path<u64>) -> Response {
@@ -256,10 +320,11 @@ async fn data(State(state): State<Shared>, Path((offset, len)): Path<(u64, u64)>
 async fn update(
     State(state): State<Shared>,
     Path((worker, round)): Path<(String, u64)>,
+    Query(info): Query<UpdateInfo>,
     body: Bytes,
 ) -> Response {
     let mut c = state.lock().unwrap();
-    if !c.workers.contains_key(&worker) {
+    if !c.seen(&worker) {
         return (StatusCode::NOT_FOUND, "unknown worker").into_response();
     }
     if round != c.round || c.finished {
@@ -272,6 +337,9 @@ async fn update(
     if c.updates.contains_key(&worker) {
         return (StatusCode::CONFLICT, "already submitted for this round").into_response();
     }
+    if info.tokens == 0 {
+        return (StatusCode::BAD_REQUEST, "update trained on no tokens").into_response();
+    }
     let delta = match decode_update(&body, c.params.len()) {
         Ok(delta) => delta,
         Err(e) => {
@@ -280,7 +348,8 @@ async fn update(
         }
     };
     println!(
-        "round {round}: update from {worker}, ‖Δ‖ = {:.4}",
+        "round {round}: update from {worker}, {} tokens, ‖Δ‖ = {:.4}",
+        info.tokens,
         l2(&delta)
     );
     c.updates.insert(worker, delta);
@@ -294,9 +363,12 @@ async fn update(
 struct Status {
     run_id: String,
     round: u64,
-    rounds: u64,
     workers: usize,
     pending_updates: usize,
+    slices: usize,
+    slices_leased: usize,
+    slices_done: usize,
+    trained_bytes: u64,
     val_loss: f32,
     finished: bool,
 }
@@ -306,15 +378,20 @@ async fn status(State(state): State<Shared>) -> Json<Status> {
     Json(Status {
         run_id: c.run.run_id.clone(),
         round: c.round,
-        rounds: c.rounds,
         workers: c.workers.len(),
         pending_updates: c.updates.len(),
+        slices: c.ledger.len(),
+        slices_leased: c.ledger.leased_count(),
+        slices_done: c.ledger.done_count(),
+        trained_bytes: c.trained_bytes,
         val_loss: c.val_loss,
         finished: c.finished,
     })
 }
 
-async fn close_stale_rounds(state: Shared) {
+/// Closes rounds that waited too long and takes slices back from workers
+/// that went quiet.
+async fn housekeeping(state: Shared) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tick.tick().await;
@@ -323,10 +400,33 @@ async fn close_stale_rounds(state: Shared) {
             println!("round {}: timed out waiting for more workers", c.round);
             c.close_round();
         }
+        let quiet: Vec<String> = c
+            .workers
+            .iter()
+            .filter(|(_, seen)| seen.elapsed() >= c.lease)
+            .map(|(w, _)| w.clone())
+            .collect();
+        for worker in quiet {
+            let released = c.ledger.release(&worker);
+            if released > 0 {
+                println!("{worker} went quiet: {released} slice(s) back in the pool");
+            }
+        }
     }
 }
 
 impl Coordinator {
+    /// Notes that `worker` is alive; false if it never joined.
+    fn seen(&mut self, worker: &str) -> bool {
+        match self.workers.get_mut(worker) {
+            Some(seen) => {
+                *seen = Instant::now();
+                true
+            }
+            None => false,
+        }
+    }
+
     fn close_round(&mut self) {
         let updates = std::mem::take(&mut self.updates);
         let from: Vec<&str> = updates.keys().map(String::as_str).collect();
@@ -336,22 +436,41 @@ impl Coordinator {
         self.val_loss = self.model.loss(&self.params, &self.val);
         self.weights = Bytes::from(encode_f32s(&self.params));
         println!(
-            "round {} closed with {} update(s) from {}: val loss {:.4}",
+            "round {} closed with {} update(s) from {}: val loss {:.4}, {}/{} slices done ({})",
             self.round,
             deltas.len(),
             from.join(", "),
-            self.val_loss
+            self.val_loss,
+            self.ledger.done_count(),
+            self.ledger.len(),
+            bytes(self.trained_bytes),
         );
         self.round += 1;
         self.round_started = Instant::now();
-        if self.round >= self.rounds {
-            self.finished = true;
-            println!("run finished after {} rounds", self.rounds);
-            if let Some(path) = &self.out {
-                match std::fs::write(path, &self.weights) {
-                    Ok(()) => println!("final weights written to {}", path.display()),
-                    Err(e) => println!("could not write final weights to {}: {e}", path.display()),
-                }
+        if self.rounds.is_some_and(|r| self.round >= r) {
+            self.finish(&format!("after {} rounds", self.round));
+        } else {
+            self.finish_if_data_done();
+        }
+    }
+
+    /// Ends the run once every slice is trained on and merged.
+    fn finish_if_data_done(&mut self) {
+        if !self.finished && self.updates.is_empty() && self.ledger.finished() {
+            self.finish(&format!(
+                "with all data trained on, after {} rounds",
+                self.round
+            ));
+        }
+    }
+
+    fn finish(&mut self, why: &str) {
+        self.finished = true;
+        println!("run finished {why}");
+        if let Some(path) = &self.out {
+            match std::fs::write(path, &self.weights) {
+                Ok(()) => println!("final weights written to {}", path.display()),
+                Err(e) => println!("could not write final weights to {}: {e}", path.display()),
             }
         }
     }
@@ -373,6 +492,11 @@ fn split_corpus(corpus: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (train.concat(), val.concat())
 }
 
-fn splitmix(x: u64) -> u64 {
-    dti_model::Rng::new(x).next_u64()
+fn bytes(n: u64) -> String {
+    match n {
+        n if n >= 1 << 30 => format!("{:.2} GiB", n as f64 / (1u64 << 30) as f64),
+        n if n >= 1 << 20 => format!("{:.1} MiB", n as f64 / (1u64 << 20) as f64),
+        n if n >= 1 << 10 => format!("{:.1} KiB", n as f64 / 1024.0),
+        n => format!("{n} B"),
+    }
 }
